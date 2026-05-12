@@ -350,3 +350,157 @@ def test_run_nonexistent_script_errors_before_assign(mock_client):
     result = runner.invoke(app, ["run", "/no/such/file.py"])
     assert result.exit_code != 0
     mock_client.assign.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# SystemExit handling — the kernel reports `sys.exit(N)` as an error output of
+# `ename=='SystemExit'`. We want native-`python`-like semantics: exit 0 for
+# `SystemExit(0)` (no traceback printed), and propagate the integer for
+# `SystemExit(N)`.
+# ---------------------------------------------------------------------------
+
+
+def _systemexit_output(evalue: str):
+    """Shape of the kernel's error output for `raise SystemExit(<evalue>)`."""
+    return {
+        "output_type": "error",
+        "ename": "SystemExit",
+        "evalue": evalue,
+        "traceback": [
+            "An exception has occurred, use %tb to see the full traceback.\n",
+            f"\x1b[0;31mSystemExit\x1b[0m\x1b[0;31m:\x1b[0m {evalue}\n",
+        ],
+    }
+
+
+def test_run_systemexit_zero_treated_as_success(
+    mock_client,
+    mock_store,
+    mock_runtime_class,
+    mock_spawn_keep_alive,
+    assign_response,
+    script_path,
+    capfd,
+):
+    """`raise SystemExit(0)` from the script body must NOT make the CLI exit
+    non-zero, AND the SystemExit traceback must NOT be printed (it's noise
+    that doesn't appear when running `python script.py`)."""
+    mock_client.assign.return_value = assign_response
+    mock_runtime = mock_runtime_class.return_value
+
+    def execute_with_systemexit(code, output_hook=None, **kwargs):
+        outputs = [_systemexit_output("0")]
+        if output_hook:
+            for o in outputs:
+                output_hook(o)
+        return outputs
+
+    mock_runtime.execute_code.side_effect = execute_with_systemexit
+
+    persisted = {}
+    mock_store.add.side_effect = lambda s: persisted.setdefault("s", s)
+    mock_store.get.side_effect = lambda name: persisted.get("s")
+
+    result = runner.invoke(app, ["run", str(script_path)])
+    captured = capfd.readouterr()
+
+    assert result.exit_code == 0, result.output
+    # The IPython "An exception has occurred..." traceback must be suppressed.
+    assert "An exception has occurred" not in (
+        result.output + result.stderr + captured.out + captured.err
+    )
+    # Cleanup still happened.
+    mock_client.unassign.assert_called_once_with("ep-123")
+
+
+def test_run_systemexit_nonzero_propagates_code(
+    mock_client,
+    mock_store,
+    mock_runtime_class,
+    mock_spawn_keep_alive,
+    assign_response,
+    script_path,
+):
+    """`raise SystemExit(7)` from the script must surface as exit code 7
+    (matching `python script.py` semantics)."""
+    mock_client.assign.return_value = assign_response
+    mock_runtime = mock_runtime_class.return_value
+
+    def execute_with_systemexit(code, output_hook=None, **kwargs):
+        outputs = [_systemexit_output("7")]
+        if output_hook:
+            for o in outputs:
+                output_hook(o)
+        return outputs
+
+    mock_runtime.execute_code.side_effect = execute_with_systemexit
+
+    persisted = {}
+    mock_store.add.side_effect = lambda s: persisted.setdefault("s", s)
+    mock_store.get.side_effect = lambda name: persisted.get("s")
+
+    result = runner.invoke(app, ["run", str(script_path)])
+    assert result.exit_code == 7
+    mock_client.unassign.assert_called_once_with("ep-123")
+
+
+def test_run_systemexit_string_message_exits_one(
+    mock_client,
+    mock_store,
+    mock_runtime_class,
+    mock_spawn_keep_alive,
+    assign_response,
+    script_path,
+):
+    """`sys.exit('boom')` (string arg, like `python -c "import sys; sys.exit(\"x\")"`)
+    must (a) exit non-zero (CPython uses 1) and (b) print the message so the
+    user sees what went wrong."""
+    mock_client.assign.return_value = assign_response
+    mock_runtime = mock_runtime_class.return_value
+
+    def execute_with_systemexit(code, output_hook=None, **kwargs):
+        outputs = [_systemexit_output("boom")]
+        if output_hook:
+            for o in outputs:
+                output_hook(o)
+        return outputs
+
+    mock_runtime.execute_code.side_effect = execute_with_systemexit
+
+    persisted = {}
+    mock_store.add.side_effect = lambda s: persisted.setdefault("s", s)
+    mock_store.get.side_effect = lambda name: persisted.get("s")
+
+    result = runner.invoke(app, ["run", str(script_path)])
+    assert result.exit_code == 1
+    mock_client.unassign.assert_called_once_with("ep-123")
+
+
+def test_run_prelude_suppresses_ipython_exit_warning(
+    mock_client,
+    mock_store,
+    mock_runtime_class,
+    mock_spawn_keep_alive,
+    assign_response,
+    script_path,
+):
+    """The prelude must mute IPython's 'To exit: use exit, quit, or Ctrl-D'
+    UserWarning, which fires whenever the user calls `sys.exit(...)` (i.e.
+    every well-formed CLI script)."""
+    mock_client.assign.return_value = assign_response
+    mock_runtime = mock_runtime_class.return_value
+    mock_runtime.execute_code.return_value = []
+
+    persisted = {}
+    mock_store.add.side_effect = lambda s: persisted.setdefault("s", s)
+    mock_store.get.side_effect = lambda name: persisted.get("s")
+
+    result = runner.invoke(app, ["run", str(script_path)])
+    assert result.exit_code == 0, result.output
+
+    # Find the body-bearing execute_code call.
+    code_calls = [c.args[0] for c in mock_runtime.execute_code.call_args_list]
+    body = next(c for c in code_calls if "hello from script" in c)
+    # Look for the warnings filter targeting IPython's exit-warning text.
+    assert "warnings.filterwarnings" in body
+    assert "To exit: use" in body

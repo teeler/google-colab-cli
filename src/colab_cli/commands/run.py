@@ -79,9 +79,13 @@ def _build_script_payload(script_path: str, script_args: List[str]) -> str:
     Specifically:
       - `sys.argv = [<basename>, *script_args]` so `argparse` etc. work.
       - `__name__ = '__main__'` so `if __name__ == "__main__":` guards fire.
+      - Suppress the IPython UserWarning "To exit: use 'exit', 'quit', or
+        Ctrl-D." which fires whenever the script calls `sys.exit(...)`. This
+        warning is meaningful in an interactive REPL, but for `colab run` it
+        is pure noise that doesn't appear when running `python script.py`.
 
-    The script body is appended verbatim; the prelude is short so any traceback
-    line numbers from user code remain close to the original.
+    The script body is appended verbatim; the prelude is short so any
+    traceback line numbers from user code remain close to the original.
     """
     basename = os.path.basename(script_path)
     with open(script_path, "r", encoding="utf-8") as f:
@@ -92,11 +96,10 @@ def _build_script_payload(script_path: str, script_args: List[str]) -> str:
     argv_literal = "[" + ", ".join(repr(x) for x in [basename, *script_args]) + "]"
 
     return (
-        "import sys\n"
+        "import sys, warnings\n"
         f"sys.argv = {argv_literal}\n"
         "__name__ = '__main__'\n"
-        # Strip any shebang line so the kernel doesn't trip on `#!/usr/bin/env`.
-        + ("" if not body.startswith("#!") else "")
+        "warnings.filterwarnings('ignore', message=\"To exit: use\")\n"
         + _strip_shebang(body)
     )
 
@@ -112,9 +115,69 @@ def _strip_shebang(body: str) -> str:
     return body
 
 
-def _output_has_error(outputs) -> bool:
-    """True if the kernel returned at least one error output for the cell."""
-    return any(o.get("output_type") == "error" for o in outputs)
+def _is_systemexit(out) -> bool:
+    """True iff this output is a `raise SystemExit(...)` (a.k.a. `sys.exit`)."""
+    return out.get("output_type") == "error" and out.get("ename") == "SystemExit"
+
+
+def _systemexit_code(out) -> int:
+    """Map a SystemExit kernel output back to a CPython-style integer exit code.
+
+    CPython conventions (mirrored):
+      - `sys.exit()` / `sys.exit(None)` / `sys.exit(0)` -> 0
+      - `sys.exit(<int>)`                                -> <int>
+      - `sys.exit('msg')` (any non-int)                  -> 1
+    """
+    evalue = (out.get("evalue") or "").strip()
+    if evalue in ("", "None", "0"):
+        return 0
+    try:
+        return int(evalue)
+    except ValueError:
+        return 1
+
+
+def _exit_code_from_outputs(outputs) -> int:
+    """Derive the CLI's exit code from the kernel's outputs for a single cell.
+
+    A `SystemExit` is treated like CPython would treat the same call from a
+    plain `python script.py` invocation. Any *other* error (uncaught
+    exception, NameError, etc.) is exit 1.
+    """
+    code = 0
+    for o in outputs:
+        if o.get("output_type") != "error":
+            continue
+        if _is_systemexit(o):
+            ec = _systemexit_code(o)
+            # Last SystemExit wins, matching the runtime — and any non-zero
+            # eclipses any prior zero.
+            code = ec if ec != 0 else code
+        else:
+            return 1
+    return code
+
+
+def _make_run_output_hook(output_image=None):
+    """Build an `output_hook` for `runtime.execute_code` that:
+      - Routes normal output to `display_output` (stream/image/error).
+      - Suppresses the `SystemExit` traceback so `sys.exit(0)` is silent (it
+        wouldn't print anything under `python script.py` either) and
+        `sys.exit(N)` doesn't dump a noisy IPython-styled traceback when the
+        intent is "shell exit code N".
+
+    The kernel still RETURNS the SystemExit output to us (so we can derive the
+    exit code in `_exit_code_from_outputs`); we just don't render it.
+    """
+    # Imported here to avoid a circular import via execution.py at module load.
+    from colab_cli.commands.execution import display_output
+
+    def hook(out):
+        if _is_systemexit(out):
+            return
+        display_output(out, output_image)
+
+    return hook
 
 
 def run_command(
@@ -320,14 +383,8 @@ def run_command(
         )
         state.store.add(s)
 
-        # Local import to keep `display_output` in one place — execution.py is
-        # the single source of truth for stream/image/error rendering.
-        from colab_cli.commands.execution import display_output
-
         try:
-            outputs = runtime.execute_code(
-                payload, output_hook=lambda o: display_output(o)
-            )
+            outputs = runtime.execute_code(payload, output_hook=_make_run_output_hook())
         except Exception:
             # Genuine transport-level failure. Cleanup still happens via the
             # outer finally; surface non-zero exit so callers/CI notice.
@@ -335,8 +392,8 @@ def run_command(
             cleanup_reason = "run_failed"
             raise
         else:
-            if _output_has_error(outputs):
-                exit_code = 1
+            exit_code = _exit_code_from_outputs(outputs)
+            if exit_code != 0:
                 cleanup_reason = "run_failed"
             state.history.log_event(
                 name,
